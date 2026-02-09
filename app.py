@@ -129,6 +129,16 @@ if apply_dev_days:
     for g in ["IMT", "LIMT", "CFn", "CFoc"]:
         dev_map[g] = 10
 
+st.sidebar.header("Cover requirement")
+required_staff_per_day = st.sidebar.number_input(
+    "Required staff per weekday day (all wards combined)",
+    min_value=1, max_value=50, value=9, step=1
+)
+working_days_per_year = st.sidebar.number_input(
+    "Weekday day shifts per year (for locum estimate)",
+    min_value=200, max_value=365, value=260, step=5
+)
+
 # -----------------------------
 # APPLY CONFIG
 # -----------------------------
@@ -175,17 +185,39 @@ overall_oncall_lost_wte = float(scenario["oncall_WTE_lost"].sum())
 overall_oncall_ward_remaining = float(scenario["oncall_ward_WTE_remaining"].sum())
 
 # -----------------------------
+# COVER + LOCUM ESTIMATE
+# -----------------------------
+# Cover % is relative to the required staff per weekday day.
+cover_pct = 100.0 * (total_ward_wte / required_staff_per_day) if required_staff_per_day > 0 else 0.0
+cover_pct_display = min(cover_pct, 100.0)
+
+# Locum shifts/year to fill the *average* shortfall (weekday day shifts only)
+gap_staff_per_day = max(0.0, required_staff_per_day - total_ward_wte)
+locum_shifts_per_year = gap_staff_per_day * float(working_days_per_year)
+
+# -----------------------------
 # OUTPUT
 # -----------------------------
 st.title("Geriatrics Staffing Capacity Model")
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total ward-facing WTE", f"{total_ward_wte:.2f}", f"{total_ward_wte - baseline_ward_wte:+.2f}")
-k2.metric("Total headcount", f"{total_headcount:.0f}")
-k3.metric("On-call WTE investment", f"{overall_oncall_invest_wte:.2f}")
-k4.metric("WTE lost to on-call", f"{overall_oncall_lost_wte:.2f}")
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 
-st.caption(f"On-call groups' ward-facing WTE remaining (after on-call loss): {overall_oncall_ward_remaining:.2f}")
+k1.metric(
+    "Total ward-facing WTE",
+    f"{total_ward_wte:.2f}",
+    f"{total_ward_wte - baseline_ward_wte:+.2f}"
+)
+k2.metric("% cover (weekday days)", f"{cover_pct_display:.0f}%")
+k3.metric("Locum day-shifts/year", f"{locum_shifts_per_year:.0f}")
+k4.metric("Total headcount", f"{total_headcount:.0f}")
+k5.metric("On-call WTE investment", f"{overall_oncall_invest_wte:.2f}")
+k6.metric("WTE lost to on-call", f"{overall_oncall_lost_wte:.2f}")
+
+st.caption(
+    f"Assumptions for cover: requirement={required_staff_per_day} staff per weekday day; "
+    f"locum estimate uses {working_days_per_year} weekday day shifts/year. "
+    f"On-call groups' ward-facing WTE remaining (after on-call loss): {overall_oncall_ward_remaining:.2f}."
+)
 
 st.divider()
 
@@ -207,7 +239,6 @@ with right:
         "WTE_lost_to_oncall": oncall_lost_by_grade.values
     })
     st.dataframe(table, use_container_width=True)
-
     st.caption("Chart: on-call WTE investment")
     st.bar_chart(oncall_invest_by_grade)
 
