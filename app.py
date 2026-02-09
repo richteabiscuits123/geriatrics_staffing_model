@@ -59,6 +59,47 @@ for _, row in df.sort_values("staff_group").iterrows():
     default = int(round(float(row["headcount"])))
     new_counts[g] = st.sidebar.number_input(g, min_value=0, max_value=200, value=default, step=1)
 
-st.sidebar.header("Assu
+st.sidebar.header("Assumptions")
+sickness_rate = st.sidebar.slider("Sickness allowance", 0.00, 0.15, 0.05, 0.01)
 
+st.sidebar.subheader("Development days (per person per year)")
+dev_days_default = st.sidebar.number_input("Default dev days (all groups)", min_value=0, max_value=40, value=0, step=1)
 
+# Toggle: apply 10 development days to selected groups
+apply_10_to_key = st.sidebar.checkbox("Apply 10 dev days to IMT, LIMT, Clinical Fellows", value=True)
+dev_map = {}
+if apply_10_to_key:
+    for key in ["IMT","LIMT","CFn","CFoc"]:
+        dev_map[key] = 10
+
+# ---------- Apply config ----------
+df2 = df.copy()
+df2["headcount"] = df2["staff_group"].map(new_counts).fillna(df2["headcount"]).astype(float)
+
+baseline = recalc(df, sickness_rate=0.0, dev_days_map={}, default_dev_days=0)  # clean baseline without extra allowances
+scenario = recalc(df2, sickness_rate=sickness_rate, dev_days_map=dev_map, default_dev_days=dev_days_default)
+
+# ---------- KPIs ----------
+total = float(scenario["total_WTE"].sum())
+baseline_total = float(baseline["total_WTE"].sum())
+delta = total - baseline_total
+
+oncall_pool = float(scenario.loc[scenario["oncall_loss"] > 0, "headcount"].sum())
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Total ward-facing WTE", f"{total:.2f}", f"{delta:+.2f} vs baseline (no sickness/dev)")
+c2.metric("On-call pool headcount", f"{oncall_pool:.0f}")
+c3.metric("Sickness + dev applied to", "IMT/LIMT/CF" if apply_10_to_key else "custom/default")
+
+st.divider()
+
+st.subheader("Ward-facing WTE by staff group")
+plot = scenario[["staff_group","total_WTE"]].copy()
+plot["staff_group"] = plot["staff_group"].astype(str)
+st.bar_chart(plot.set_index("staff_group")["total_WTE"])
+
+st.subheader("Detailed table")
+show = scenario[[
+    "staff_group","headcount","leave_factor","oncall_loss","dev_days","availability_factor","effective_WTE","total_WTE"
+]].sort_values("staff_group")
+st.dataframe(show, use_container_width=True)
