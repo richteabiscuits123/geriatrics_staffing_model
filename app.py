@@ -57,28 +57,48 @@ def grade_of(staff_group: str) -> str:
 # MODEL CALCULATION
 # -----------------------------
 def recalc(d, sickness_rate=0.05, dev_days_map=None):
+    """
+    Returns a dataframe with:
+    - establishment_WTE_per_person (before on-call loss)
+    - ward_effective_WTE_per_person (after on-call loss)
+    - totals, and on-call investment metrics
+    """
     if dev_days_map is None:
         dev_days_map = {}
 
     out = d.copy()
-
     out["grade"] = out["staff_group"].map(grade_of)
 
+    # Development days
     out["dev_days"] = out["staff_group"].map(dev_days_map).fillna(0)
     out["dev_factor"] = out["dev_days"] / 260.0  # approx working days/year
 
+    # Availability after sickness + dev days
     out["availability_factor"] = (1 - sickness_rate) * (1 - out["dev_factor"])
 
-    out["effective_WTE"] = (
+    # Establishment WTE (before on-call loss)
+    out["establishment_WTE_per_person"] = (
         out["base_WTE"]
         * out["pattern_factor"]
         * out["days_factor"]
         * out["leave_factor"]
-        * (1 - out["oncall_loss"])
         * out["availability_factor"]
     )
 
-    out["total_WTE"] = out["headcount"] * out["effective_WTE"]
+    # Ward-facing WTE (after on-call loss)
+    out["ward_effective_WTE_per_person"] = (
+        out["establishment_WTE_per_person"] * (1 - out["oncall_loss"])
+    )
+
+    # Totals
+    out["establishment_WTE_total"] = out["headcount"] * out["establishment_WTE_per_person"]
+    out["ward_WTE_total"] = out["headcount"] * out["ward_effective_WTE_per_person"]
+
+    # On-call investment metrics (only meaningful where oncall_loss > 0)
+    out["oncall_WTE_investment"] = out["establishment_WTE_total"].where(out["oncall_loss"] > 0, 0)
+    out["oncall_WTE_lost"] = (out["establishment_WTE_total"] * out["oncall_loss"]).where(out["oncall_loss"] > 0, 0)
+    out["oncall_ward_WTE_remaining"] = out["ward_WTE_total"].where(out["oncall_loss"] > 0, 0)
+
     return out
 
 # -----------------------------
@@ -93,7 +113,7 @@ for _, row in df.sort_values("staff_group").iterrows():
         g,
         min_value=0,
         max_value=200,
-        value=int(row["headcount"]),
+        value=int(round(row["headcount"])),
         step=1
     )
 
@@ -119,10 +139,11 @@ baseline = recalc(df, sickness_rate=0.0, dev_days_map={})
 scenario = recalc(df2, sickness_rate=sickness_rate, dev_days_map=dev_map)
 
 # -----------------------------
-# HEADCOUNT SUMMARIES
+# SUMMARIES
 # -----------------------------
 total_headcount = float(scenario["headcount"].sum())
 
+# Headcount by grade
 hc_by_grade = (
     scenario.groupby("grade", dropna=False)["headcount"]
     .sum()
@@ -130,27 +151,41 @@ hc_by_grade = (
     .fillna(0)
 )
 
-oncall_by_grade = (
-    scenario.loc[scenario["oncall_loss"] > 0]
-    .groupby("grade", dropna=False)["headcount"]
+# On-call by grade: WTE investment and WTE lost
+oncall_invest_by_grade = (
+    scenario.groupby("grade", dropna=False)["oncall_WTE_investment"]
     .sum()
     .reindex(["Foundation", "Core", "GPST", "ACP", "Other"])
     .fillna(0)
 )
+
+oncall_lost_by_grade = (
+    scenario.groupby("grade", dropna=False)["oncall_WTE_lost"]
+    .sum()
+    .reindex(["Foundation", "Core", "GPST", "ACP", "Other"])
+    .fillna(0)
+)
+
+# Overall WTE
+total_ward_wte = float(scenario["ward_WTE_total"].sum())
+baseline_ward_wte = float(baseline["ward_WTE_total"].sum())
+
+overall_oncall_invest_wte = float(scenario["oncall_WTE_investment"].sum())
+overall_oncall_lost_wte = float(scenario["oncall_WTE_lost"].sum())
+overall_oncall_ward_remaining = float(scenario["oncall_ward_WTE_remaining"].sum())
 
 # -----------------------------
 # OUTPUT
 # -----------------------------
 st.title("Geriatrics Staffing Capacity Model")
 
-total_wte = float(scenario["total_WTE"].sum())
-baseline_wte = float(baseline["total_WTE"].sum())
-
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total Ward-Facing WTE", f"{total_wte:.2f}", f"{total_wte - baseline_wte:+.2f}")
-k2.metric("Total Headcount", f"{total_headcount:.0f}")
-k3.metric("On-Call Pool (Headcount)", f"{scenario.loc[scenario.oncall_loss > 0, 'headcount'].sum():.0f}")
-k4.metric("Sickness + Dev Days Applied", "Yes" if apply_dev_days else "No")
+k1.metric("Total ward-facing WTE", f"{total_ward_wte:.2f}", f"{total_ward_wte - baseline_ward_wte:+.2f}")
+k2.metric("Total headcount", f"{total_headcount:.0f}")
+k3.metric("On-call WTE investment", f"{overall_oncall_invest_wte:.2f}")
+k4.metric("WTE lost to on-call", f"{overall_oncall_lost_wte:.2f}")
+
+st.caption(f"On-call groups' ward-facing WTE remaining (after on-call loss): {overall_oncall_ward_remaining:.2f}")
 
 st.divider()
 
@@ -165,26 +200,31 @@ with left:
     st.bar_chart(hc_by_grade)
 
 with right:
-    st.subheader("On-call headcount by grade")
-    st.dataframe(
-        oncall_by_grade.reset_index().rename(columns={"index": "grade", "headcount": "oncall_headcount"}),
-        use_container_width=True
-    )
-    st.bar_chart(oncall_by_grade)
+    st.subheader("On-call commitment by grade (WTE)")
+    table = pd.DataFrame({
+        "grade": oncall_invest_by_grade.index,
+        "oncall_WTE_investment": oncall_invest_by_grade.values,
+        "WTE_lost_to_oncall": oncall_lost_by_grade.values
+    })
+    st.dataframe(table, use_container_width=True)
+
+    st.caption("Chart: on-call WTE investment")
+    st.bar_chart(oncall_invest_by_grade)
 
 st.divider()
 
-st.subheader("Ward-Facing WTE by staff group")
-plot_df = scenario[["staff_group", "total_WTE"]].copy()
+st.subheader("Ward-facing WTE by staff group")
+plot_df = scenario[["staff_group", "ward_WTE_total"]].copy()
 plot_df["staff_group"] = plot_df["staff_group"].astype(str)
-st.bar_chart(plot_df.set_index("staff_group")["total_WTE"])
+st.bar_chart(plot_df.set_index("staff_group")["ward_WTE_total"])
 
 st.subheader("Detailed Workforce Table")
-st.dataframe(
-    scenario[[
-        "grade", "staff_group", "headcount",
-        "leave_factor", "oncall_loss", "dev_days",
-        "availability_factor", "effective_WTE", "total_WTE"
-    ]].sort_values(["grade", "staff_group"]),
-    use_container_width=True
-)
+detail = scenario[[
+    "grade", "staff_group", "headcount",
+    "leave_factor", "oncall_loss", "dev_days",
+    "availability_factor",
+    "establishment_WTE_total", "oncall_WTE_investment", "oncall_WTE_lost",
+    "ward_WTE_total"
+]].sort_values(["grade", "staff_group"])
+
+st.dataframe(detail, use_container_width=True)
