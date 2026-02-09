@@ -12,14 +12,20 @@ STAFF_SHEET = "Staff"
 df = pd.read_excel(EXCEL_PATH, sheet_name=STAFF_SHEET)
 df.columns = [str(c).strip() for c in df.columns]
 
-# Ensure staff_group column exists
 if "staff_group" not in df.columns:
     df = df.rename(columns={df.columns[0]: "staff_group"})
 
-# Clean bad Excel rows
 df["staff_group"] = df["staff_group"].astype(str).str.strip()
 df = df[df["staff_group"].ne("")]
 df = df[df["staff_group"].ne("nan")]
+
+# Clean numeric columns safely
+numeric_cols = [
+    "headcount", "base_WTE", "pattern_factor",
+    "days_factor", "leave_factor", "oncall_loss"
+]
+for col in numeric_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
 required = [
     "staff_group", "headcount", "base_WTE",
@@ -31,7 +37,7 @@ if missing:
     st.stop()
 
 # -----------------------------
-# MODEL CALCULATION FUNCTION
+# MODEL CALCULATION
 # -----------------------------
 def recalc(d, sickness_rate=0.05, dev_days_map=None):
     if dev_days_map is None:
@@ -39,11 +45,9 @@ def recalc(d, sickness_rate=0.05, dev_days_map=None):
 
     out = d.copy()
 
-    # Development days → capacity loss
     out["dev_days"] = out["staff_group"].map(dev_days_map).fillna(0)
-    out["dev_factor"] = out["dev_days"] / 260.0  # working days approx
+    out["dev_factor"] = out["dev_days"] / 260.0
 
-    # Availability after sickness + dev days
     out["availability_factor"] = (1 - sickness_rate) * (1 - out["dev_factor"])
 
     out["effective_WTE"] = (
@@ -59,7 +63,7 @@ def recalc(d, sickness_rate=0.05, dev_days_map=None):
     return out
 
 # -----------------------------
-# SIDEBAR CONFIGURATION
+# SIDEBAR CONFIG
 # -----------------------------
 st.sidebar.header("Headcount Configuration")
 
@@ -67,8 +71,11 @@ new_counts = {}
 for _, row in df.sort_values("staff_group").iterrows():
     g = row["staff_group"]
     new_counts[g] = st.sidebar.number_input(
-        g, min_value=0, max_value=200,
-        value=int(row["headcount"]), step=1
+        g,
+        min_value=0,
+        max_value=200,
+        value=int(row["headcount"]),
+        step=1
     )
 
 st.sidebar.header("Assumptions")
@@ -93,7 +100,7 @@ baseline = recalc(df, sickness_rate=0.0, dev_days_map={})
 scenario = recalc(df2, sickness_rate=sickness_rate, dev_days_map=dev_map)
 
 # -----------------------------
-# DASHBOARD OUTPUT
+# OUTPUT
 # -----------------------------
 st.title("Geriatrics Staffing Capacity Model")
 
