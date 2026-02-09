@@ -39,8 +39,15 @@ col1.metric("Total Ward WTE", f"{df2.total_WTE.sum():.2f}")
 col2.metric("On-call Pool", f"{df2.loc[df2.oncall_loss>0,'headcount'].sum():.0f}")
 
 st.subheader("Ward WTE by Staff Group")
+
+plot_df = df2.copy()
+plot_df["staff_group"] = plot_df["staff_group"].astype(str)
+plot_df["total_WTE"] = pd.to_numeric(plot_df["total_WTE"], errors="coerce")
+
 fig = plt.figure()
-plt.barh(df2.staff_group, df2.total_WTE)
+plt.barh(plot_df["staff_group"], plot_df["total_WTE"])
+plt.xlabel("Total ward-facing WTE")
+plt.ylabel("Staff group")
 st.pyplot(fig)
 
 st.subheader("Detail Table")
