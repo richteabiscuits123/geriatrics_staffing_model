@@ -1,4 +1,4 @@
-import math
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -39,9 +39,8 @@ if missing:
 # -----------------------------
 # GRADE GROUPING (updated)
 # -----------------------------
-# User request:
-# - Core + GPST => "SHO-grade"
-# - Foundation => "Foundation-grade"
+# Core + GPST => "SHO-grade"
+# Foundation => "Foundation-grade"
 GRADE_MAP = {
     "FY1": "Foundation-grade",
     "FY2": "Foundation-grade",
@@ -53,52 +52,28 @@ GRADE_MAP = {
     "GPST": "SHO-grade",
     "ACP": "ACP",
 }
-
 def grade_of(staff_group: str) -> str:
     return GRADE_MAP.get(staff_group, "Other")
-
-# -----------------------------
-# BINOMIAL HELPERS (no SciPy needed)
-# -----------------------------
-def binom_pmf(n: int, k: int, p: float) -> float:
-    if k < 0 or k > n:
-        return 0.0
-    return math.comb(n, k) * (p ** k) * ((1 - p) ** (n - k))
-
-def prob_at_least(n: int, r: int, p: float) -> float:
-    # P(X >= r)
-    if r <= 0:
-        return 1.0
-    if r > n:
-        return 0.0
-    return sum(binom_pmf(n, k, p) for k in range(r, n + 1))
-
-def expected_shortfall(n: int, r: int, p: float) -> float:
-    # E[max(0, r - X)]
-    if r <= 0:
-        return 0.0
-    if n <= 0:
-        return float(r)
-    return sum((r - k) * binom_pmf(n, k, p) for k in range(0, min(r, n + 1)))
-
-def required_n_for_target(r: int, p: float, target: float, n_max: int = 200) -> int:
-    # Smallest n such that P(X >= r) >= target
-    if r <= 0:
-        return 0
-    for n in range(r, n_max + 1):
-        if prob_at_least(n, r, p) >= target:
-            return n
-    return n_max
 
 # -----------------------------
 # MODEL CALCULATION
 # -----------------------------
 def recalc(d, sickness_rate=0.05, dev_days_map=None):
     """
-    Separates:
-      - scheduled ward WTE (planned capacity: leave + oncall_loss)
-      - expected ward WTE (mean after sickness + dev days)
-    Also computes on-call WTE commitment split by grade.
+    scheduled_ward_WTE_per_person:
+      planned ward-facing contribution per person (after leave + oncall_loss),
+      but BEFORE sickness/dev (availability).
+
+    availability_factor:
+      probability-like multiplier from sickness + dev days.
+
+    ward_effective_WTE_per_person (mean):
+      scheduled_ward_WTE_per_person * availability_factor
+
+    oncall_WTE_lost (scheduled):
+      how much establishment WTE is diverted into on-call (your "giving to on-call"),
+      defined as scheduled_establishment_WTE_total * oncall_loss
+      (i.e., BEFORE sickness/dev).
     """
     if dev_days_map is None:
         dev_days_map = {}
@@ -106,14 +81,13 @@ def recalc(d, sickness_rate=0.05, dev_days_map=None):
     out = d.copy()
     out["grade"] = out["staff_group"].map(grade_of)
 
-    # Development days (probabilistic availability driver)
-    out["dev_days"] = out["staff_group"].map(dev_days_map).fillna(0)
+    # Dev days -> availability
+    out["dev_days"] = out["staff_group"].map(dev_days_map).fillna(0).astype(float)
     out["dev_factor"] = out["dev_days"] / 260.0  # approx working days/year
 
-    # Availability factor
     out["availability_factor"] = (1 - sickness_rate) * (1 - out["dev_factor"])
 
-    # Scheduled ward-facing WTE per person (no sickness/dev)
+    # Planned ward-facing contribution per person (no sickness/dev)
     out["scheduled_ward_WTE_per_person"] = (
         out["base_WTE"]
         * out["pattern_factor"]
@@ -122,16 +96,15 @@ def recalc(d, sickness_rate=0.05, dev_days_map=None):
         * (1 - out["oncall_loss"])
     )
 
-    # Expected ward-facing WTE per person (mean after sickness/dev)
+    # Mean ward-facing after availability
     out["ward_effective_WTE_per_person"] = (
         out["scheduled_ward_WTE_per_person"] * out["availability_factor"]
     )
 
-    # Totals
     out["scheduled_ward_WTE_total"] = out["headcount"] * out["scheduled_ward_WTE_per_person"]
-    out["ward_WTE_total"] = out["headcount"] * out["ward_effective_WTE_per_person"]
+    out["ward_WTE_total_mean"] = out["headcount"] * out["ward_effective_WTE_per_person"]
 
-    # Scheduled establishment WTE (before oncall_loss) for on-call commitment reporting
+    # Establishment WTE (scheduled, before on-call loss, before sickness/dev)
     out["scheduled_establishment_WTE_per_person"] = (
         out["base_WTE"]
         * out["pattern_factor"]
@@ -140,11 +113,53 @@ def recalc(d, sickness_rate=0.05, dev_days_map=None):
     )
     out["scheduled_establishment_WTE_total"] = out["headcount"] * out["scheduled_establishment_WTE_per_person"]
 
-    # On-call commitment WTE (investment) and ward WTE lost to on-call
-    out["oncall_WTE_commitment"] = out["scheduled_establishment_WTE_total"].where(out["oncall_loss"] > 0, 0)
+    # "Giving to on-call": scheduled WTE diverted by on-call loss assumption
     out["oncall_WTE_lost"] = (out["scheduled_establishment_WTE_total"] * out["oncall_loss"]).where(out["oncall_loss"] > 0, 0)
 
     return out
+
+# -----------------------------
+# MONTE CARLO COVER SIMULATION
+# -----------------------------
+def simulate_cover(scenario_df: pd.DataFrame, required_wte: float, sim_days: int, seed: int = 1):
+    """
+    Builds an individual-level pool:
+      each person contributes scheduled_ward_WTE_per_person if present that day,
+      and is present with probability availability_factor.
+
+    Returns:
+      p_meet, expected_shortfall_per_day, expected_locum_wte_days_per_year
+    """
+    rng = np.random.default_rng(seed)
+
+    # Expand to individuals
+    weights = []
+    probs = []
+    for _, row in scenario_df.iterrows():
+        n = int(round(row["headcount"]))
+        if n <= 0:
+            continue
+        w = float(row["scheduled_ward_WTE_per_person"])
+        p = float(row["availability_factor"])
+        p = min(max(p, 0.0), 1.0)
+        weights.extend([w] * n)
+        probs.extend([p] * n)
+
+    if len(weights) == 0:
+        return 0.0, float(required_wte), float(required_wte) * 260.0
+
+    w = np.array(weights, dtype=float)          # (N,)
+    p = np.array(probs, dtype=float)            # (N,)
+
+    # Simulate presence matrix: (sim_days, N)
+    present = rng.random((sim_days, len(w))) < p
+    available_wte = present @ w  # (sim_days,)
+
+    shortfall = np.maximum(0.0, required_wte - available_wte)
+
+    p_meet = float(np.mean(available_wte >= required_wte))
+    exp_shortfall_per_day = float(np.mean(shortfall))
+    return p_meet, exp_shortfall_per_day
 
 # -----------------------------
 # SIDEBAR CONFIG
@@ -169,16 +184,19 @@ if apply_dev_days:
     for g in ["IMT", "LIMT", "CFn", "CFoc"]:
         dev_map[g] = 10
 
-st.sidebar.header("Cover / Reliability")
+st.sidebar.header("Cover / Locum")
 required_staff_per_day = st.sidebar.number_input(
-    "Required staff available per weekday day (pooled)",
-    min_value=1, max_value=60, value=9, step=1
+    "Required pooled cover (WTE-equivalent per weekday day)",
+    min_value=1.0, max_value=60.0, value=9.0, step=1.0
 )
-reliability_target = st.sidebar.slider("Reliability target", 0.50, 0.99, 0.95, 0.01)
 working_days_per_year = st.sidebar.number_input(
-    "Weekday day shifts per year (locum estimate)",
+    "Weekday day shifts per year",
     min_value=200, max_value=365, value=260, step=5
 )
+
+st.sidebar.header("Simulation")
+sim_days = st.sidebar.slider("Simulation days (more = smoother)", 2000, 50000, 20000, 2000)
+seed = st.sidebar.number_input("Random seed", min_value=1, max_value=9999, value=1, step=1)
 
 # -----------------------------
 # APPLY CONFIG
@@ -186,24 +204,16 @@ working_days_per_year = st.sidebar.number_input(
 df2 = df.copy()
 df2["headcount"] = df2["staff_group"].map(new_counts).fillna(0)
 
-baseline = recalc(df, sickness_rate=0.0, dev_days_map={})
 scenario = recalc(df2, sickness_rate=sickness_rate, dev_days_map=dev_map)
 
 # -----------------------------
-# KEY TOTALS
+# SUMMARIES
 # -----------------------------
 total_headcount = float(scenario["headcount"].sum())
+scheduled_ward_wte = float(scenario["scheduled_ward_WTE_total"].sum())
+mean_ward_wte = float(scenario["ward_WTE_total_mean"].sum())
 
-total_scheduled_ward_wte = float(scenario["scheduled_ward_WTE_total"].sum())  # before sickness/dev
-total_expected_ward_wte = float(scenario["ward_WTE_total"].sum())            # mean after sickness/dev
-
-# On-call commitment by grade (WTE)
-oncall_commit_by_grade = (
-    scenario.groupby("grade", dropna=False)["oncall_WTE_commitment"]
-    .sum()
-    .reindex(["Foundation-grade", "SHO-grade", "ACP", "Other"])
-    .fillna(0)
-)
+# On-call WTE lost (overall + by grade)  ✅ user requested
 oncall_lost_by_grade = (
     scenario.groupby("grade", dropna=False)["oncall_WTE_lost"]
     .sum()
@@ -211,31 +221,20 @@ oncall_lost_by_grade = (
     .fillna(0)
 )
 
-overall_oncall_commit_wte = float(scenario["oncall_WTE_commitment"].sum())
-overall_oncall_lost_wte = float(scenario["oncall_WTE_lost"].sum())
+oncall_lost_foundation = float(oncall_lost_by_grade.get("Foundation-grade", 0.0))
+oncall_lost_sho = float(oncall_lost_by_grade.get("SHO-grade", 0.0))
+oncall_lost_total = float(scenario["oncall_WTE_lost"].sum())
 
-# -----------------------------
-# PROBABILISTIC COVER MODEL (pooled)
-# -----------------------------
-# Effective availability probability from sickness/dev assumptions.
-if total_scheduled_ward_wte > 0:
-    p_eff = max(0.0, min(1.0, total_expected_ward_wte / total_scheduled_ward_wte))
-else:
-    p_eff = 0.0
+# Cover simulation
+p_meet, exp_shortfall_per_day = simulate_cover(
+    scenario_df=scenario,
+    required_wte=float(required_staff_per_day),
+    sim_days=int(sim_days),
+    seed=int(seed)
+)
+locum_wte_days_per_year = exp_shortfall_per_day * float(working_days_per_year)
 
-# Make N conservative: floor to avoid paradoxical "improves when we cut staff" due to rounding up.
-N_current = int(math.floor(total_scheduled_ward_wte + 1e-9))
-
-prob_meet = prob_at_least(N_current, int(required_staff_per_day), p_eff)
-shortfall_per_day = expected_shortfall(N_current, int(required_staff_per_day), p_eff)
-locum_shifts_per_year = shortfall_per_day * float(working_days_per_year)
-
-N_required = required_n_for_target(int(required_staff_per_day), p_eff, float(reliability_target), n_max=200)
-wte_gap_to_target = max(0, N_required - N_current)
-
-# -----------------------------
-# HEADCOUNT BY GRADE
-# -----------------------------
+# Headcount by grade (still useful)
 hc_by_grade = (
     scenario.groupby("grade", dropna=False)["headcount"]
     .sum()
@@ -248,23 +247,21 @@ hc_by_grade = (
 # -----------------------------
 st.title("Geriatrics Staffing Capacity Model")
 
-# Top-line metrics (added two on-call commitment metrics by grade)
+# Top metrics row (now includes WTE LOST to on-call by grade)
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
-
-k1.metric("Expected ward-facing WTE (mean)", f"{total_expected_ward_wte:.2f}")
-k2.metric("Scheduled ward WTE", f"{total_scheduled_ward_wte:.2f}")
-k3.metric("P(meet cover) with flexing", f"{100*prob_meet:.1f}%")
-k4.metric("Locum day-shifts/year (expected)", f"{locum_shifts_per_year:.0f}")
-k5.metric("WTE for target reliability", f"{N_required} (gap {wte_gap_to_target:+})")
-k6.metric("On-call WTE lost", f"{overall_oncall_lost_wte:.2f}")
-k7.metric("On-call WTE (Foundation-grade)", f"{float(oncall_commit_by_grade.get('Foundation-grade', 0.0)):.2f}")
-k8.metric("On-call WTE (SHO-grade)", f"{float(oncall_commit_by_grade.get('SHO-grade', 0.0)):.2f}")
+k1.metric("Mean ward-facing WTE", f"{mean_ward_wte:.2f}")
+k2.metric("Scheduled ward WTE", f"{scheduled_ward_wte:.2f}")
+k3.metric("P(meet cover) with flexing", f"{100*p_meet:.1f}%")
+k4.metric("Locum WTE-day shifts/year", f"{locum_wte_days_per_year:.0f}")
+k5.metric("Total headcount", f"{total_headcount:.0f}")
+k6.metric("WTE lost to on-call (total)", f"{oncall_lost_total:.2f}")
+k7.metric("WTE lost to on-call (Foundation)", f"{oncall_lost_foundation:.2f}")
+k8.metric("WTE lost to on-call (SHO)", f"{oncall_lost_sho:.2f}")
 
 st.caption(
-    f"Cover requirement: ≥{required_staff_per_day} staff available per weekday day (pooled across wards). "
-    f"Effective availability p ≈ {p_eff:.3f} derived from sickness/dev assumptions. "
-    f"Binomial model uses N = floor(scheduled ward WTE) = {N_current}. "
-    f"Reliability target = {reliability_target:.2f}."
+    f"Cover requirement is {required_staff_per_day:.0f} WTE-equivalent per weekday day (pooled across wards). "
+    f"Simulation uses {sim_days} days (seed={seed}); increase sim-days if you want smoother locum estimates. "
+    f"Locum estimate is expected shortfall per day × {working_days_per_year} weekday shifts/year."
 )
 
 st.divider()
@@ -280,30 +277,26 @@ with left:
     st.bar_chart(hc_by_grade)
 
 with right:
-    st.subheader("On-call commitment by grade (WTE)")
-    table = pd.DataFrame({
-        "grade": oncall_commit_by_grade.index,
-        "oncall_WTE_commitment": oncall_commit_by_grade.values,
-        "WTE_lost_to_oncall": oncall_lost_by_grade.values
-    })
-    st.dataframe(table, use_container_width=True)
-    st.caption("Chart: on-call WTE commitment")
-    st.bar_chart(oncall_commit_by_grade)
+    st.subheader("On-call WTE lost by grade (\"given\" to on-call)")
+    lost_tbl = oncall_lost_by_grade.reset_index()
+    lost_tbl.columns = ["grade", "WTE_lost_to_oncall"]
+    st.dataframe(lost_tbl, use_container_width=True)
+    st.bar_chart(oncall_lost_by_grade)
 
 st.divider()
 
-st.subheader("Ward-facing WTE by staff group (expected mean)")
-plot_df = scenario[["staff_group", "ward_WTE_total"]].copy()
+st.subheader("Mean ward-facing WTE by staff group")
+plot_df = scenario[["staff_group", "ward_WTE_total_mean"]].copy()
 plot_df["staff_group"] = plot_df["staff_group"].astype(str)
-st.bar_chart(plot_df.set_index("staff_group")["ward_WTE_total"])
+st.bar_chart(plot_df.set_index("staff_group")["ward_WTE_total_mean"])
 
 st.subheader("Detailed Workforce Table")
 detail = scenario[[
     "grade", "staff_group", "headcount",
     "leave_factor", "oncall_loss", "dev_days",
     "availability_factor",
-    "scheduled_ward_WTE_total", "ward_WTE_total",
-    "oncall_WTE_commitment", "oncall_WTE_lost"
+    "scheduled_ward_WTE_total", "ward_WTE_total_mean",
+    "oncall_WTE_lost"
 ]].sort_values(["grade", "staff_group"])
 
 st.dataframe(detail, use_container_width=True)
